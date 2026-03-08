@@ -739,22 +739,19 @@ Include every listing you find. Use null for missing fields. Find as many as pos
             : `Recherche en cours… (étape ${turnCount})`
         );
 
-        const response = await fetch(
-          "https://api.anthropic.com/v1/messages",
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              model: "claude-sonnet-4-20250514",
-              max_tokens: 16000,
-              system: systemPrompt,
-              tools: [
-                { type: "web_search_20250305", name: "web_search" },
-              ],
-              messages,
-            }),
-          }
-        );
+        const response = await fetch("/api/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-20250514",
+            max_tokens: 16000,
+            system: systemPrompt,
+            tools: [
+              { type: "web_search_20250305", name: "web_search" },
+            ],
+            messages,
+          }),
+        });
 
         const data = await response.json();
 
