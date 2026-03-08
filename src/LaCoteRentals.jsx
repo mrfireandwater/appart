@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 const TOWNS = [
   { name: "Rolle", lat: 46.4601, lng: 6.3372, radius: 0 },
@@ -85,6 +85,194 @@ function parseListings(text) {
     }
   }
   return [];
+}
+
+// Resolve lat/lng for a listing: use provided coords, or fall back to town coords with jitter
+function resolveCoords(listing) {
+  if (listing.lat && listing.lng) return { lat: listing.lat, lng: listing.lng };
+  const townName = (listing.town || "").toLowerCase();
+  const match = TOWNS.find(
+    (tw) =>
+      townName.includes(tw.name.toLowerCase()) ||
+      tw.name.toLowerCase().includes(townName)
+  );
+  if (match) {
+    // Add small random jitter so overlapping markers spread out
+    const jitter = () => (Math.random() - 0.5) * 0.006;
+    return { lat: match.lat + jitter(), lng: match.lng + jitter() };
+  }
+  return null;
+}
+
+// Compute price per m² color on a green-to-red gradient
+function pricePerSqmColor(ratio, minRatio, maxRatio) {
+  if (minRatio === maxRatio) return "#888";
+  const t = (ratio - minRatio) / (maxRatio - minRatio); // 0 = cheapest (green), 1 = most expensive (red)
+  // HSL: 120 = green, 0 = red
+  const hue = Math.round((1 - t) * 120);
+  return `hsl(${hue}, 80%, 45%)`;
+}
+
+// Leaflet-based heatmap component
+function HeatmapView({ listings, onSelectListing }) {
+  const mapContainerRef = useRef(null);
+  const mapInstanceRef = useRef(null);
+  const markersRef = useRef([]);
+
+  // Compute price/m² for listings that have both price and surface
+  const listingsWithRatio = useMemo(() => {
+    return listings
+      .map((l) => {
+        const coords = resolveCoords(l);
+        if (!coords) return null;
+        const ratio = l.price && l.surface ? l.price / l.surface : null;
+        return { ...l, ...coords, pricePerSqm: ratio };
+      })
+      .filter(Boolean);
+  }, [listings]);
+
+  const ratios = listingsWithRatio.map((l) => l.pricePerSqm).filter(Boolean);
+  const minRatio = ratios.length > 0 ? Math.min(...ratios) : 0;
+  const maxRatio = ratios.length > 0 ? Math.max(...ratios) : 1;
+
+  useEffect(() => {
+    if (!mapContainerRef.current || !window.L) return;
+
+    // Init map once
+    if (!mapInstanceRef.current) {
+      const map = window.L.map(mapContainerRef.current).setView([46.46, 6.34], 12);
+      window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+        maxZoom: 18,
+      }).addTo(map);
+      mapInstanceRef.current = map;
+    }
+
+    const map = mapInstanceRef.current;
+
+    // Clear previous markers
+    markersRef.current.forEach((m) => map.removeLayer(m));
+    markersRef.current = [];
+
+    // Add markers
+    listingsWithRatio.forEach((listing) => {
+      const color = listing.pricePerSqm
+        ? pricePerSqmColor(listing.pricePerSqm, minRatio, maxRatio)
+        : "#888";
+
+      const ratioText = listing.pricePerSqm
+        ? `${Math.round(listing.pricePerSqm)} CHF/m²`
+        : "prix/m² inconnu";
+
+      const icon = window.L.divIcon({
+        className: "",
+        html: `<div style="
+          width:28px;height:28px;border-radius:50%;
+          background:${color};border:3px solid #fff;
+          box-shadow:0 2px 6px rgba(0,0,0,0.35);
+          display:flex;align-items:center;justify-content:center;
+          font-size:10px;color:#fff;font-weight:700;font-family:monospace;
+          cursor:pointer;
+        ">${listing.pricePerSqm ? Math.round(listing.pricePerSqm) : "?"}</div>`,
+        iconSize: [28, 28],
+        iconAnchor: [14, 14],
+      });
+
+      const features = [];
+      if (listing.floor) features.push(`Etage: ${listing.floor}`);
+      if (listing.availableFrom) features.push(`Dispo: ${listing.availableFrom}`);
+      if (listing.address) features.push(listing.address);
+      if (listing.parking) features.push(`Parking: ${listing.parking}`);
+      if (listing.balcony) features.push("Balcon/Terrasse");
+      if (listing.laundry) features.push(listing.laundry);
+      const featuresHtml = features.length > 0
+        ? `<div style="margin-top:6px;font-size:11px;color:#6b6056;line-height:1.5">${features.join("<br/>")}</div>`
+        : "";
+
+      const popupHtml = `
+        <div style="font-family:Georgia,serif;max-width:280px">
+          <strong style="font-size:14px;color:#2d2926">${listing.title || "Appartement"}</strong>
+          <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;font-size:12px">
+            ${listing.price ? `<span style="background:#2c6e49;color:#fff;padding:2px 8px;border-radius:4px;font-family:monospace;font-weight:700">CHF ${listing.price}</span>` : ""}
+            ${listing.rooms ? `<span>${listing.rooms} pcs</span>` : ""}
+            ${listing.surface ? `<span>${listing.surface} m²</span>` : ""}
+          </div>
+          <div style="margin-top:4px;font-size:12px;font-weight:700;color:${color}">${ratioText}</div>
+          ${featuresHtml}
+          ${listing.description ? `<p style="margin-top:6px;font-size:11px;color:#7a7068;line-height:1.4">${listing.description.substring(0, 150)}${listing.description.length > 150 ? "..." : ""}</p>` : ""}
+          <div style="margin-top:8px;display:flex;justify-content:space-between;align-items:center">
+            ${listing.source ? `<span style="font-size:10px;background:#8b7d6b;color:#fff;padding:2px 6px;border-radius:3px;font-family:monospace;text-transform:uppercase">${listing.source}</span>` : ""}
+            ${listing.url ? `<a href="${listing.url}" target="_blank" rel="noopener noreferrer" style="font-size:12px;color:#c0392b;font-weight:600;text-decoration:none">Voir l'annonce &rarr;</a>` : ""}
+          </div>
+        </div>
+      `;
+
+      const marker = window.L.marker([listing.lat, listing.lng], { icon })
+        .addTo(map)
+        .bindPopup(popupHtml, { maxWidth: 300 });
+
+      markersRef.current.push(marker);
+    });
+
+    // Fit bounds if we have markers
+    if (listingsWithRatio.length > 0) {
+      const bounds = window.L.latLngBounds(
+        listingsWithRatio.map((l) => [l.lat, l.lng])
+      );
+      map.fitBounds(bounds.pad(0.15));
+    }
+  }, [listingsWithRatio, minRatio, maxRatio]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (mapInstanceRef.current) {
+        mapInstanceRef.current.remove();
+        mapInstanceRef.current = null;
+      }
+    };
+  }, []);
+
+  return (
+    <div>
+      {/* Legend */}
+      <div style={{
+        display: "flex", alignItems: "center", gap: "12px",
+        marginBottom: "12px", padding: "10px 16px",
+        background: "#fff", borderRadius: "8px", border: "1px solid #e8e2d8",
+        fontSize: "13px", color: "#6b6056", flexWrap: "wrap",
+      }}>
+        <span style={{ fontWeight: 700 }}>Prix/m² :</span>
+        <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+          <div style={{ width: "16px", height: "16px", borderRadius: "50%", background: "hsl(120,80%,45%)" }} />
+          <span>{ratios.length > 0 ? `${Math.round(minRatio)} CHF/m²` : "—"}</span>
+        </div>
+        <div style={{
+          width: "120px", height: "12px", borderRadius: "6px",
+          background: "linear-gradient(90deg, hsl(120,80%,45%), hsl(60,80%,45%), hsl(0,80%,45%))",
+        }} />
+        <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+          <div style={{ width: "16px", height: "16px", borderRadius: "50%", background: "hsl(0,80%,45%)" }} />
+          <span>{ratios.length > 0 ? `${Math.round(maxRatio)} CHF/m²` : "—"}</span>
+        </div>
+        <span style={{ marginLeft: "auto", fontSize: "11px", color: "#a09888" }}>
+          {listingsWithRatio.length} annonces sur la carte
+          {listingsWithRatio.length < listings.length && ` (${listings.length - listingsWithRatio.length} sans localisation)`}
+        </span>
+      </div>
+
+      {/* Map */}
+      <div
+        ref={mapContainerRef}
+        style={{
+          height: "600px",
+          borderRadius: "12px",
+          border: "1px solid #e8e2d8",
+          overflow: "hidden",
+        }}
+      />
+    </div>
+  );
 }
 
 // Simple SVG map of La Côte region
@@ -289,6 +477,10 @@ function LaCoteMap({ listings, selectedTown, onTownClick }) {
 
 // Listing card component
 function ListingCard({ listing }) {
+  const pricePerSqm = listing.price && listing.surface
+    ? Math.round(listing.price / listing.surface)
+    : null;
+
   return (
     <div
       style={{
@@ -362,7 +554,7 @@ function ListingCard({ listing }) {
       >
         {listing.town && (
           <span style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-            📍 {listing.town}
+            📍 {listing.address || listing.town}
           </span>
         )}
         {listing.rooms && (
@@ -375,7 +567,23 @@ function ListingCard({ listing }) {
             📐 {listing.surface} m²
           </span>
         )}
+        {pricePerSqm && (
+          <span style={{ display: "flex", alignItems: "center", gap: "4px", fontWeight: 600, color: "#c0392b" }}>
+            💰 {pricePerSqm} CHF/m²
+          </span>
+        )}
       </div>
+
+      {/* Extra characteristics */}
+      {(listing.floor || listing.availableFrom || listing.parking || listing.balcony) && (
+        <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", fontSize: "12px", color: "#8b7d6b" }}>
+          {listing.floor && <span>Etage: {listing.floor}</span>}
+          {listing.availableFrom && <span>Dispo: {listing.availableFrom}</span>}
+          {listing.parking && <span>Parking: {listing.parking}</span>}
+          {listing.balcony && <span>Balcon/Terrasse</span>}
+          {listing.laundry && <span>{listing.laundry}</span>}
+        </div>
+      )}
 
       {listing.description && (
         <p
@@ -447,6 +655,7 @@ export default function LaCoteRentals() {
   const [error, setError] = useState(null);
   const [searchDone, setSearchDone] = useState(false);
   const [statusMsg, setStatusMsg] = useState("");
+  const [viewMode, setViewMode] = useState("list"); // "list" or "heatmap"
 
   // Filters
   const [maxPrice, setMaxPrice] = useState(5000);
@@ -465,31 +674,61 @@ export default function LaCoteRentals() {
     const geranceNames = GERANCES.map((g) => `${g.name} (${g.town})`).join(", ");
     const geranceUrls = GERANCES.slice(0, 12).map((g) => g.url).join(", ");
 
-    const systemPrompt = `You are a Swiss real estate search assistant specializing in the La Côte region (canton de Vaud). Your job is to search for apartment rental listings from both major platforms AND local property management companies (gérances). Always use web search to find real, current listings. After searching, return ONLY a valid JSON array of listings, no other text. Each listing object must have: title, price (number), rooms (number), surface (number or null), town, description, source, url.`;
+    const systemPrompt = `You are a Swiss real estate search assistant specializing in the La Côte region (canton de Vaud). Your job is to search for individual apartment rental listings from both major platforms AND local property management companies (gérances).
+
+CRITICAL INSTRUCTIONS:
+1. Always use web search to find real, current listings.
+2. For each listing, you MUST navigate to the INDIVIDUAL apartment page (not search results pages). The "url" field must be the direct link to that specific apartment's detail page.
+3. From each apartment's detail page, extract ALL available characteristics: price, rooms, surface, floor/étage, availability date, full address, parking, balcony/terrace, laundry, charges included or not, etc.
+4. After searching, return ONLY a valid JSON array of listings, no other text.
+
+Each listing object must have these fields:
+- title (string): apartment title
+- price (number): monthly rent in CHF
+- rooms (number): number of rooms (pièces)
+- surface (number or null): living area in m²
+- town (string): town/city name
+- address (string or null): full street address if available
+- floor (string or null): floor/étage (e.g. "3ème étage", "Rez-de-chaussée")
+- availableFrom (string or null): availability date (e.g. "01.04.2026", "Immédiat")
+- parking (string or null): parking info (e.g. "1 place intérieure", "Garage")
+- balcony (boolean): true if balcony or terrace
+- laundry (string or null): laundry info (e.g. "Buanderie commune", "Machine dans l'appt")
+- chargesIncluded (boolean or null): whether charges are included in price
+- description (string): detailed description from the listing page
+- source (string): name of the gérance or platform
+- url (string): DIRECT link to this specific apartment's detail page (NOT a search results page)
+- lat (number or null): latitude if available
+- lng (number or null): longitude if available`;
 
     const userPrompt = `Search for current apartment rental listings ("appartement à louer") in the La Côte region of Switzerland, near these towns within 10km of Rolle: ${townNames}.
 
-IMPORTANT: Search on BOTH major platforms AND local gérances (property management companies):
+IMPORTANT INSTRUCTIONS:
+1. Search on BOTH major platforms AND local gérances
+2. For EACH listing found, click through to the INDIVIDUAL apartment page
+3. Extract the DIRECT URL of each apartment's detail page (not search results)
+4. Extract ALL available details from each apartment page: price, surface, rooms, floor, availability, address, parking, balcony, etc.
 
-1. Major platforms: immoscout24.ch, homegate.ch for "appartement louer Rolle", "location Gland", "louer Nyon", "louer Morges"
+PLATFORMS to search:
+- immoscout24.ch: search "appartement louer Rolle", click into each listing
+- homegate.ch: search "location Rolle", click into each listing
 
-2. Local USPI Vaud gérances active in La Côte - search their websites for current rental offers:
+LOCAL GÉRANCES to search (check their websites for current offers):
 ${geranceNames}
 
-Key gérance websites to check: ${geranceUrls}
+Key gérance websites: ${geranceUrls}
 
-Search for "location appartement" on each gérance site. Extract real listings with actual prices and addresses.
+For each gérance site, find the "objets à louer" / "locations" section and click into individual listings.
 
-After searching, return ONLY a JSON array with this exact format, no markdown, no backticks, no explanation:
-[{"title":"Bel appartement 3.5 pièces","price":1850,"rooms":3.5,"surface":85,"town":"Rolle","description":"Lumineux appartement avec vue lac","source":"Cogestim","url":"https://example.com"}]
+Return ONLY a JSON array, no markdown, no backticks, no explanation. Example format:
+[{"title":"Bel appartement 3.5 pièces","price":1850,"rooms":3.5,"surface":85,"town":"Rolle","address":"Rue du Port 12, 1180 Rolle","floor":"2ème étage","availableFrom":"01.05.2026","parking":"1 place extérieure","balcony":true,"laundry":"Buanderie commune","chargesIncluded":false,"description":"Lumineux appartement rénové avec vue sur le lac...","source":"Cogestim","url":"https://www.cogestim.ch/louer/appartement-123","lat":46.4601,"lng":6.3372}]
 
-The "source" field should be the name of the gérance or platform where you found the listing.
 Include every listing you find. Use null for missing fields. Find as many as possible (aim for 20+).`;
 
     try {
       let messages = [{ role: "user", content: userPrompt }];
       let allText = "";
-      let maxTurns = 15; // safety limit for the conversation loop
+      let maxTurns = 15;
       let turnCount = 0;
 
       while (turnCount < maxTurns) {
@@ -531,24 +770,16 @@ Include every listing you find. Use null for missing fields. Find as many as pos
 
         if (turnText) allText += "\n" + turnText;
 
-        // If the model is done (not requesting more tool use), we're finished
         if (data.stop_reason === "end_turn" || data.stop_reason === "stop") {
           break;
         }
 
-        // If the model wants to use tools, we need to feed back the response
-        // and continue the conversation. The web_search tool is server-side,
-        // so we just pass the full content back as an assistant turn.
         if (data.stop_reason === "tool_use") {
-          // Add assistant response to conversation
           messages = [
             ...messages,
             { role: "assistant", content: data.content },
           ];
 
-          // For each tool_use block, add a tool_result
-          // With server-side web search, the results come automatically,
-          // but we need to add placeholder tool results for any tool_use blocks
           const toolUseBlocks = (data.content || []).filter(
             (b) => b.type === "tool_use"
           );
@@ -565,23 +796,19 @@ Include every listing you find. Use null for missing fields. Find as many as pos
               { role: "user", content: toolResults },
             ];
           } else {
-            // No tool_use blocks but stop_reason is tool_use? Break to avoid infinite loop
             break;
           }
         } else {
-          // Unknown stop reason, break
           break;
         }
       }
 
-      // Parse all collected text
       if (allText.trim()) {
         const parsed = parseListings(allText);
         if (parsed.length > 0) {
           setListings(parsed);
           setStatusMsg("");
         } else {
-          // Debug: show first 300 chars of response
           console.log("Raw API text:", allText.substring(0, 500));
           setError(
             "Résultats reçus mais impossible de les structurer. La réponse ne contenait pas de données JSON exploitables. Essayez à nouveau."
@@ -726,6 +953,10 @@ Include every listing you find. Use null for missing fields. Find as many as pos
           cursor: pointer;
           border: 2px solid #fff;
           box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+        }
+        .leaflet-popup-content-wrapper {
+          border-radius: 10px !important;
+          box-shadow: 0 4px 16px rgba(0,0,0,0.15) !important;
         }
       `}</style>
 
@@ -1058,35 +1289,82 @@ Include every listing you find. Use null for missing fields. Find as many as pos
           </div>
         )}
 
-        {/* Results */}
+        {/* Results: view toggle + content */}
         {!loading && filtered.length > 0 && (
           <div>
-            <h2
-              style={{
-                fontSize: "18px",
-                fontWeight: 700,
-                color: "#2d2926",
-                margin: "0 0 16px",
-              }}
-            >
-              Annonces disponibles
-            </h2>
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(auto-fill, minmax(340px, 1fr))",
-                gap: "16px",
-              }}
-            >
-              {filtered.map((listing, i) => (
-                <div
-                  key={i}
-                  style={{ animation: `fadeIn 0.3s ease ${i * 0.05}s both` }}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
+              <h2
+                style={{
+                  fontSize: "18px",
+                  fontWeight: 700,
+                  color: "#2d2926",
+                  margin: 0,
+                }}
+              >
+                Annonces disponibles
+              </h2>
+
+              {/* View toggle */}
+              <div style={{ display: "flex", gap: "4px", background: "#e8e2d8", borderRadius: "8px", padding: "3px" }}>
+                <button
+                  onClick={() => setViewMode("list")}
+                  style={{
+                    padding: "8px 16px",
+                    borderRadius: "6px",
+                    border: "none",
+                    background: viewMode === "list" ? "#fff" : "transparent",
+                    color: viewMode === "list" ? "#2d2926" : "#8b7d6b",
+                    fontSize: "13px",
+                    fontWeight: 600,
+                    cursor: "pointer",
+                    fontFamily: "Georgia, serif",
+                    boxShadow: viewMode === "list" ? "0 1px 4px rgba(0,0,0,0.1)" : "none",
+                    transition: "all 0.2s",
+                  }}
                 >
-                  <ListingCard listing={listing} />
-                </div>
-              ))}
+                  📋 Liste
+                </button>
+                <button
+                  onClick={() => setViewMode("heatmap")}
+                  style={{
+                    padding: "8px 16px",
+                    borderRadius: "6px",
+                    border: "none",
+                    background: viewMode === "heatmap" ? "#fff" : "transparent",
+                    color: viewMode === "heatmap" ? "#2d2926" : "#8b7d6b",
+                    fontSize: "13px",
+                    fontWeight: 600,
+                    cursor: "pointer",
+                    fontFamily: "Georgia, serif",
+                    boxShadow: viewMode === "heatmap" ? "0 1px 4px rgba(0,0,0,0.1)" : "none",
+                    transition: "all 0.2s",
+                  }}
+                >
+                  🌡️ Carte Prix/m²
+                </button>
+              </div>
             </div>
+
+            {viewMode === "list" ? (
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fill, minmax(340px, 1fr))",
+                  gap: "16px",
+                }}
+              >
+                {filtered.map((listing, i) => (
+                  <div
+                    key={i}
+                    style={{ animation: `fadeIn 0.3s ease ${i * 0.05}s both` }}
+                  >
+                    <ListingCard listing={listing} />
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <HeatmapView listings={filtered} />
+            )}
           </div>
         )}
 
